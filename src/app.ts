@@ -216,7 +216,7 @@ app.post('/api/people/:id/moments', async (request, response, next) => {
       return
     }
 
-    const customText = String(request.body.text || '').trim()
+    const customText = String(request.body?.text || '').trim()
     const messages = person.messages || []
     if (!customText && messages.length === 0) {
       response.status(409).json({
