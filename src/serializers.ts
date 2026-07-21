@@ -3,6 +3,7 @@ import type {
   MessageDocument,
   MomentDocument,
   PersonDocument,
+  UserProfileDocument,
   ThankDocument,
 } from './database.js'
 
@@ -23,14 +24,18 @@ export function serializeMoment(moment: MomentDocument) {
   }
 }
 
-export function serializePerson(person: WithId<PersonDocument>) {
+export function serializePerson(
+  person: WithId<PersonDocument>,
+  linkedProfile?: WithId<UserProfileDocument> | null,
+) {
   return {
     id: person._id.toString(),
-    name: person.name,
+    name: linkedProfile?.displayName || person.name,
     relationship: person.relationship || '',
     color: person.color || '#FFD7D2',
-    avatarDataUrl: person.avatarDataUrl || '',
+    avatarDataUrl: linkedProfile?.photoURL || person.avatarDataUrl || '',
     isLinked: Boolean(person.linkedUserId),
+    linkedUsername: linkedProfile?.username || null,
     messages: (person.messages || []).map(serializeMessage),
     moments: (person.moments || []).map(serializeMoment),
     createdAt: person.createdAt.toISOString(),

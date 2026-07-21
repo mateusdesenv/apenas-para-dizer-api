@@ -39,6 +39,27 @@ export interface InvitationDocument {
   acceptedBy?: string
 }
 
+export interface UserProfileDocument {
+  _id?: ObjectId
+  uid: string
+  username?: string
+  normalizedUsername?: string
+  displayName: string
+  photoURL: string
+  createdAt: Date
+  updatedAt: Date
+}
+
+export interface FriendRequestDocument {
+  _id?: ObjectId
+  senderId: string
+  recipientId: string
+  personId?: ObjectId
+  status: 'pending' | 'accepted' | 'rejected'
+  createdAt: Date
+  updatedAt: Date
+}
+
 export interface ThankDocument {
   _id?: ObjectId
   ownerId: string
@@ -50,6 +71,8 @@ export interface ThankDocument {
 const client = new MongoClient(config.mongoUri)
 let peopleCollection: Collection<PersonDocument> | undefined
 let invitationsCollection: Collection<InvitationDocument> | undefined
+let profilesCollection: Collection<UserProfileDocument> | undefined
+let friendRequestsCollection: Collection<FriendRequestDocument> | undefined
 let thanksCollection: Collection<ThankDocument> | undefined
 
 async function database() {
@@ -82,6 +105,38 @@ export async function invitations(): Promise<Collection<InvitationDocument>> {
     ])
   }
   return invitationsCollection
+}
+
+export async function profiles(): Promise<Collection<UserProfileDocument>> {
+  if (!profilesCollection) {
+    profilesCollection = (await database()).collection('profiles')
+    await Promise.all([
+      profilesCollection.createIndex({ uid: 1 }, { unique: true }),
+      profilesCollection.createIndex(
+        { normalizedUsername: 1 },
+        {
+          unique: true,
+          partialFilterExpression: { normalizedUsername: { $type: 'string' } },
+        },
+      ),
+    ])
+  }
+  return profilesCollection
+}
+
+export async function friendRequests(): Promise<Collection<FriendRequestDocument>> {
+  if (!friendRequestsCollection) {
+    friendRequestsCollection = (await database()).collection('friendRequests')
+    await Promise.all([
+      friendRequestsCollection.createIndex({ recipientId: 1, status: 1, createdAt: -1 }),
+      friendRequestsCollection.createIndex({ senderId: 1, status: 1, createdAt: -1 }),
+      friendRequestsCollection.createIndex(
+        { senderId: 1, recipientId: 1 },
+        { unique: true, partialFilterExpression: { status: 'pending' } },
+      ),
+    ])
+  }
+  return friendRequestsCollection
 }
 
 export async function thanks(): Promise<Collection<ThankDocument>> {

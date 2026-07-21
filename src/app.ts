@@ -7,6 +7,7 @@ import { config } from './config.js'
 import {
   invitations,
   people,
+  profiles,
   thanks,
   type MessageDocument,
   type MomentDocument,
@@ -17,6 +18,7 @@ import {
   serializeThank,
 } from './serializers.js'
 import { isValidAvatarDataUrl, normalizeColor } from './validation.js'
+import socialRouter from './social.js'
 
 const app = express()
 
@@ -47,6 +49,7 @@ app.get('/api/health', (_request, response) => {
 
 app.use('/api/people', requireAuthentication)
 app.use('/api/thanks', requireAuthentication)
+app.use('/api/social', requireAuthentication, socialRouter)
 
 function hashInvitationToken(token: string) {
   return createHash('sha256').update(token).digest('hex')
@@ -58,7 +61,15 @@ app.get('/api/people', async (request, response, next) => {
       .find({ ownerId: request.user!.uid })
       .sort({ updatedAt: -1 })
       .toArray()
-    response.json(records.map(serializePerson))
+    const linkedIds = records.flatMap((record) => record.linkedUserId ? [record.linkedUserId] : [])
+    const linkedProfiles = linkedIds.length
+      ? await (await profiles()).find({ uid: { $in: linkedIds } }).toArray()
+      : []
+    const profileByUid = new Map(linkedProfiles.map((profile) => [profile.uid, profile]))
+    response.json(records.map((record) => serializePerson(
+      record,
+      record.linkedUserId ? profileByUid.get(record.linkedUserId) : null,
+    )))
   } catch (error) {
     next(error)
   }
