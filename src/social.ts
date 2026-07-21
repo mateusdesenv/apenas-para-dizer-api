@@ -22,6 +22,14 @@ function publicProfile(profile: UserProfileDocument) {
   }
 }
 
+function usernameFrom(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._]/g, '')
+    .slice(0, 24)
+}
+
 async function syncProfile(uid: string, claims: Record<string, unknown>) {
   const collection = await profiles()
   const existing = await collection.findOne({ uid })
@@ -36,7 +44,37 @@ async function syncProfile(uid: string, claims: Record<string, unknown>) {
     },
     { upsert: true },
   )
-  return (await collection.findOne({ uid }))!
+  let profile = (await collection.findOne({ uid }))!
+  if (!profile.username) {
+    const linkedPerson = await (await people()).findOne(
+      { linkedUserId: uid },
+      { sort: { updatedAt: -1 } },
+    )
+    const base = usernameFrom(linkedPerson?.name || displayName)
+    if (base.length >= 3) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const suffix = attempt ? String(attempt + 1) : ''
+        const candidate = `${base.slice(0, 24 - suffix.length)}${suffix}`
+        try {
+          profile = (await collection.findOneAndUpdate(
+            { uid, username: { $exists: false } },
+            {
+              $set: {
+                username: candidate,
+                normalizedUsername: normalizeUsername(candidate),
+                updatedAt: now,
+              },
+            },
+            { returnDocument: 'after' },
+          )) || profile
+          break
+        } catch (error: unknown) {
+          if ((error as { code?: number }).code !== 11000) throw error
+        }
+      }
+    }
+  }
+  return profile
 }
 
 router.get('/me', async (request, response, next) => {
