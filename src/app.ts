@@ -48,6 +48,7 @@ app.get('/api/health', (_request, response) => {
 })
 
 app.use('/api/people', requireAuthentication)
+app.use('/api/messages', requireAuthentication)
 app.use('/api/thanks', requireAuthentication)
 app.use('/api/social', requireAuthentication, socialRouter)
 
@@ -55,9 +56,73 @@ function hashInvitationToken(token: string) {
   return createHash('sha256').update(token).digest('hex')
 }
 
+app.get('/api/messages/received', async (request, response, next) => {
+  try {
+    const recipientId = request.user!.uid
+    const records = await (await people())
+      .find({ ownerId: { $ne: recipientId }, linkedUserId: recipientId })
+      .toArray()
+    const senderIds = [...new Set(records.map((record) => record.ownerId))]
+    const senderProfiles = senderIds.length
+      ? await (await profiles()).find({ uid: { $in: senderIds } }).toArray()
+      : []
+    const profileByUid = new Map(senderProfiles.map((profile) => [profile.uid, profile]))
+    const messages = records
+      .flatMap((record) => {
+        const sender = profileByUid.get(record.ownerId)
+        return (record.messages || []).map((message) => ({
+          id: message._id.toString(),
+          text: message.text,
+          createdAt: message.createdAt.toISOString(),
+          sender: {
+            displayName: sender?.displayName || 'Alguém especial',
+            photoURL: sender?.photoURL || '',
+            username: sender?.username || null,
+          },
+        }))
+      })
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+
+    response.json(messages)
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.get('/api/people', async (request, response, next) => {
   try {
-    const records = await (await people())
+    const peopleCollection = await people()
+    const ownerId = request.user!.uid
+    const incomingLinks = await peopleCollection
+      .find({ ownerId: { $ne: ownerId }, linkedUserId: ownerId })
+      .toArray()
+    const reciprocalUserIds = [...new Set(incomingLinks.map((record) => record.ownerId))]
+    if (reciprocalUserIds.length) {
+      const reciprocalProfiles = await (await profiles())
+        .find({ uid: { $in: reciprocalUserIds } })
+        .toArray()
+      const now = new Date()
+      await Promise.all(reciprocalProfiles.map((profile) => peopleCollection.updateOne(
+        { ownerId, linkedUserId: profile.uid },
+        {
+          $setOnInsert: {
+            ownerId,
+            linkedUserId: profile.uid,
+            name: profile.displayName,
+            relationship: 'Amigo(a)',
+            color: '#FFD7D2',
+            avatarDataUrl: '',
+            messages: [],
+            moments: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        { upsert: true },
+      )))
+    }
+
+    const records = await peopleCollection
       .find({ ownerId: request.user!.uid })
       .sort({ updatedAt: -1 })
       .toArray()
@@ -235,6 +300,39 @@ app.post(
         return
       }
 
+      const ownerProfile = await (await profiles()).findOne({ uid: invitation.ownerId })
+      if (!ownerProfile) {
+        await (await people()).updateOne(
+          { _id: linkedPerson._id, ownerId: invitation.ownerId, linkedUserId: request.user!.uid },
+          { $unset: { linkedUserId: '' }, $set: { updatedAt: now } },
+        )
+        await collection.updateOne(
+          { _id: invitation._id, acceptedBy: request.user!.uid },
+          { $unset: { acceptedAt: '', acceptedBy: '' } },
+        )
+        response.status(409).json({ error: 'O perfil de quem enviou o convite não está disponível.' })
+        return
+      }
+
+      await (await people()).updateOne(
+        { ownerId: request.user!.uid, linkedUserId: invitation.ownerId },
+        {
+          $setOnInsert: {
+            ownerId: request.user!.uid,
+            linkedUserId: invitation.ownerId,
+            name: ownerProfile.displayName,
+            relationship: 'Amigo(a)',
+            color: '#FFD7D2',
+            avatarDataUrl: '',
+            messages: [],
+            moments: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        { upsert: true },
+      )
+
       response.json({
         person: serializePerson(linkedPerson),
         linked: true,
@@ -305,6 +403,87 @@ app.patch('/api/people/:id', async (request, response, next) => {
       return
     }
     response.json(serializePerson(updated))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/people/:id/friendship', async (request, response, next) => {
+  try {
+    if (!ObjectId.isValid(request.params.id)) {
+      response.status(400).json({ error: 'Pessoa inválida.' })
+      return
+    }
+
+    const collection = await people()
+    const ownerId = request.user!.uid
+    const personId = new ObjectId(request.params.id)
+    const person = await collection.findOne({ _id: personId, ownerId })
+    if (!person) {
+      response.status(404).json({ error: 'Pessoa não encontrada.' })
+      return
+    }
+    if (!person.linkedUserId) {
+      response.status(409).json({ error: 'Essa pessoa não está associada a uma conta.' })
+      return
+    }
+
+    const linkedUserId = person.linkedUserId
+    const now = new Date()
+    await Promise.all([
+      collection.updateOne(
+        { _id: personId, ownerId, linkedUserId },
+        { $unset: { linkedUserId: '' }, $set: { updatedAt: now } },
+      ),
+      collection.updateMany(
+        { ownerId: linkedUserId, linkedUserId: ownerId },
+        { $unset: { linkedUserId: '' }, $set: { updatedAt: now } },
+      ),
+    ])
+
+    const updated = await collection.findOne({ _id: personId, ownerId })
+    response.json({ person: serializePerson(updated!) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/people/:id', async (request, response, next) => {
+  try {
+    if (!ObjectId.isValid(request.params.id)) {
+      response.status(400).json({ error: 'Pessoa inválida.' })
+      return
+    }
+
+    const collection = await people()
+    const query = {
+      _id: new ObjectId(request.params.id),
+      ownerId: request.user!.uid,
+    }
+    const person = await collection.findOne(query)
+    if (!person) {
+      response.status(404).json({ error: 'Pessoa não encontrada.' })
+      return
+    }
+    if (person.linkedUserId) {
+      response.status(409).json({
+        error: 'Contas cadastradas não podem ser excluídas. Desfaça a amizade.',
+        code: 'LINKED_PERSON',
+      })
+      return
+    }
+
+    const result = await collection.deleteOne({
+      ...query,
+      linkedUserId: { $exists: false },
+    })
+    if (!result.deletedCount) {
+      response.status(409).json({ error: 'Essa pessoa foi associada a uma conta e não pode ser excluída.' })
+      return
+    }
+
+    await (await invitations()).deleteMany({ ownerId: request.user!.uid, personId: person._id })
+    response.json({ ok: true })
   } catch (error) {
     next(error)
   }
