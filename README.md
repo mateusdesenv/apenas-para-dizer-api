@@ -38,6 +38,9 @@ GET    /api/people/:id
 PATCH  /api/people/:id
 POST   /api/people/:id/messages
 POST   /api/people/:id/moments
+POST   /api/people/:id/invitations
+GET    /api/invitations/:token
+POST   /api/invitations/:token/accept
 GET    /api/thanks
 POST   /api/thanks
 DELETE /api/thanks/:id

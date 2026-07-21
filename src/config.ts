@@ -13,6 +13,8 @@ export const config = {
   thanksCollection: process.env.MONGO_COLLECTION_NAME || 'obrigado',
   peopleCollection: process.env.MONGO_PEOPLE_COLLECTION_NAME || 'people',
   firebaseProjectId: process.env.FIREBASE_PROJECT_ID || 'apenas-para-dizer',
+  webAppUrl:
+    process.env.WEB_APP_URL || 'https://apenas-para-dizer-web.vercel.app',
   corsOrigins: (process.env.CORS_ORIGINS ||
     'https://apenas-para-dizer-web.vercel.app,https://anderson-obrigado.vercel.app,http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174')
     .split(',')

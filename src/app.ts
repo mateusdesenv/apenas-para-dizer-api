@@ -1,9 +1,11 @@
 import cors from 'cors'
+import { createHash, randomBytes } from 'node:crypto'
 import express, { type NextFunction, type Request, type Response } from 'express'
 import { ObjectId } from 'mongodb'
 import { requireAuthentication } from './auth.js'
 import { config } from './config.js'
 import {
+  invitations,
   people,
   thanks,
   type MessageDocument,
@@ -45,6 +47,10 @@ app.get('/api/health', (_request, response) => {
 
 app.use('/api/people', requireAuthentication)
 app.use('/api/thanks', requireAuthentication)
+
+function hashInvitationToken(token: string) {
+  return createHash('sha256').update(token).digest('hex')
+}
 
 app.get('/api/people', async (request, response, next) => {
   try {
@@ -95,6 +101,138 @@ app.post('/api/people', async (request, response, next) => {
     next(error)
   }
 })
+
+app.post('/api/people/:id/invitations', async (request, response, next) => {
+  try {
+    if (!ObjectId.isValid(request.params.id)) {
+      response.status(400).json({ error: 'Pessoa inválida.' })
+      return
+    }
+
+    const personId = new ObjectId(request.params.id)
+    const ownerId = request.user!.uid
+    const person = await (await people()).findOne({ _id: personId, ownerId })
+    if (!person) {
+      response.status(404).json({ error: 'Pessoa não encontrada.' })
+      return
+    }
+    if (person.linkedUserId) {
+      response.status(409).json({ error: 'Essa pessoa já está associada a uma conta.' })
+      return
+    }
+
+    const token = randomBytes(32).toString('base64url')
+    const now = new Date()
+    const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+    await (await invitations()).insertOne({
+      tokenHash: hashInvitationToken(token),
+      ownerId,
+      personId,
+      createdAt: now,
+      expiresAt,
+    })
+
+    const inviteUrl = new URL(config.webAppUrl)
+    inviteUrl.searchParams.set('invite', token)
+    response.status(201).json({
+      inviteUrl: inviteUrl.toString(),
+      expiresAt: expiresAt.toISOString(),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/invitations/:token', async (request, response, next) => {
+  try {
+    const invitation = await (await invitations()).findOne({
+      tokenHash: hashInvitationToken(String(request.params.token)),
+      acceptedAt: { $exists: false },
+      expiresAt: { $gt: new Date() },
+    })
+    if (!invitation) {
+      response.status(404).json({ error: 'Convite inválido, expirado ou já utilizado.' })
+      return
+    }
+    const person = await (await people()).findOne({
+      _id: invitation.personId,
+      ownerId: invitation.ownerId,
+    })
+    if (!person) {
+      response.status(404).json({ error: 'Convite inválido.' })
+      return
+    }
+    response.json({
+      personName: person.name,
+      expiresAt: invitation.expiresAt.toISOString(),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post(
+  '/api/invitations/:token/accept',
+  requireAuthentication,
+  async (request, response, next) => {
+    try {
+      const collection = await invitations()
+      const tokenHash = hashInvitationToken(String(request.params.token))
+      const now = new Date()
+      const invitation = await collection.findOneAndUpdate(
+        {
+          tokenHash,
+          acceptedAt: { $exists: false },
+          expiresAt: { $gt: now },
+        },
+        {
+          $set: {
+            acceptedAt: now,
+            acceptedBy: request.user!.uid,
+          },
+        },
+        { returnDocument: 'after' },
+      )
+      if (!invitation) {
+        response.status(409).json({ error: 'Convite inválido, expirado ou já utilizado.' })
+        return
+      }
+
+      const linkedPerson = await (await people()).findOneAndUpdate(
+        {
+          _id: invitation.personId,
+          ownerId: invitation.ownerId,
+          $or: [
+            { linkedUserId: { $exists: false } },
+            { linkedUserId: request.user!.uid },
+          ],
+        },
+        {
+          $set: {
+            linkedUserId: request.user!.uid,
+            updatedAt: now,
+          },
+        },
+        { returnDocument: 'after' },
+      )
+      if (!linkedPerson) {
+        await collection.updateOne(
+          { _id: invitation._id, acceptedBy: request.user!.uid },
+          { $unset: { acceptedAt: '', acceptedBy: '' } },
+        )
+        response.status(409).json({ error: 'Essa pessoa já está associada a outra conta.' })
+        return
+      }
+
+      response.json({
+        person: serializePerson(linkedPerson),
+        linked: true,
+      })
+    } catch (error) {
+      next(error)
+    }
+  },
+)
 
 app.get('/api/people/:id', async (request, response, next) => {
   try {

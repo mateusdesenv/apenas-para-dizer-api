@@ -30,6 +30,7 @@ export function serializePerson(person: WithId<PersonDocument>) {
     relationship: person.relationship || '',
     color: person.color || '#FFD7D2',
     avatarDataUrl: person.avatarDataUrl || '',
+    isLinked: Boolean(person.linkedUserId),
     messages: (person.messages || []).map(serializeMessage),
     moments: (person.moments || []).map(serializeMoment),
     createdAt: person.createdAt.toISOString(),
