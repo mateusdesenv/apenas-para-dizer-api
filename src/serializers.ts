@@ -10,7 +10,10 @@ import type {
 export function serializeMessage(message: MessageDocument) {
   return {
     id: message._id.toString(),
-    text: message.text,
+    type: message.type || 'moment',
+    title: message.title || '',
+    description: message.description || message.text || '',
+    text: message.description || message.text || '',
     createdAt: message.createdAt.toISOString(),
   }
 }

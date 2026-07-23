@@ -3,7 +3,10 @@ import { config } from './config.js'
 
 export interface MessageDocument {
   _id: ObjectId
-  text: string
+  type?: 'moment' | 'special'
+  title?: string
+  description?: string
+  text?: string
   createdAt: Date
 }
 

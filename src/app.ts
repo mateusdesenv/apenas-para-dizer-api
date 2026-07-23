@@ -11,6 +11,7 @@ import {
   thanks,
   type MessageDocument,
   type MomentDocument,
+  type ThankDocument,
 } from './database.js'
 import {
   serializeMoment,
@@ -47,6 +48,117 @@ app.get('/api/health', (_request, response) => {
   response.json({ ok: true })
 })
 
+app.all('/api/internal/migrate-obrigado', async (request, response, next) => {
+  try {
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress || '')) {
+      response.status(404).end()
+      return
+    }
+    if (request.get('x-migration-key') !== '6ccf67f5-2333-4ce2-8623-7c8d4965eaae') {
+      response.status(404).end()
+      return
+    }
+
+    type LegacyRecord = ThankDocument & { _id: ObjectId }
+    const importedRecords: LegacyRecord[] | null = Array.isArray(request.body?.records)
+      ? request.body.records.map((record: Record<string, unknown>) => ({
+          _id: new ObjectId(String(record.id || '')),
+          ownerId: '',
+          title: String(record.title || ''),
+          description: String(record.description || ''),
+          createdAt: new Date(String(record.createdAt || '')),
+        }))
+      : null
+    const legacyRecords: LegacyRecord[] = importedRecords
+      || await (await thanks()).find({}).sort({ createdAt: 1 }).toArray()
+    const ownerIds = [...new Set(legacyRecords.map((record) => record.ownerId).filter(Boolean))]
+    if (ownerIds.length > 1) {
+      response.status(409).json({
+        error: `Esperava no máximo um dono nos registros antigos, encontrei ${ownerIds.length}.`,
+      })
+      return
+    }
+
+    const peopleCollection = await people()
+    const andersonPeople = await peopleCollection
+      .find(ownerIds.length ? { ownerId: ownerIds[0], name: /^anderson\b/i } : { name: /^anderson\b/i })
+      .toArray()
+
+    if (andersonPeople.length !== 1) {
+      response.status(409).json({
+        error: `Esperava uma pessoa Anderson para esse usuário, encontrei ${andersonPeople.length}.`,
+      })
+      return
+    }
+
+    const invalidRecords = legacyRecords.filter((record) => (
+      (!record.title?.trim() && !record.description?.trim())
+      || Number.isNaN(record.createdAt.getTime())
+    ))
+    if (invalidRecords.length) {
+      response.status(409).json({
+        error: 'Há registros antigos incompatíveis com os limites do novo modelo.',
+        invalidIds: invalidRecords.map((record) => record._id.toString()),
+      })
+      return
+    }
+
+    const person = andersonPeople[0]
+    const ownerId = ownerIds[0] || person.ownerId
+    const ownerProfile = await (await profiles()).findOne({ uid: ownerId })
+    if (!ownerProfile) {
+      response.status(409).json({ error: 'O dono da pessoa Anderson não possui perfil no novo modelo.' })
+      return
+    }
+    const legacyIds = new Set(legacyRecords.map((record) => record._id.toString()))
+    const migratedMessageIds = (person.messages || [])
+      .filter((message) => legacyIds.has(message._id.toString()))
+      .map((message) => message._id)
+    const existingMomentIds = new Set((person.moments || []).map((moment) => moment._id.toString()))
+    const moments = legacyRecords
+      .filter((record) => !existingMomentIds.has(record._id.toString()))
+      .map((record) => ({
+        _id: record._id,
+        messageId: null,
+        text: record.description.trim() || record.title.trim(),
+        createdAt: record.createdAt,
+      }))
+
+    if (request.method === 'POST' && (migratedMessageIds.length || moments.length)) {
+      await peopleCollection.updateOne(
+        { _id: person._id, ownerId },
+        {
+          ...(migratedMessageIds.length
+            ? { $pull: { messages: { _id: { $in: migratedMessageIds } } } }
+            : {}),
+          ...(moments.length ? { $push: { moments: { $each: moments } } } : {}),
+          $set: { updatedAt: new Date() },
+        },
+      )
+    }
+
+    response.json({
+      dryRun: request.method !== 'POST',
+      legacyCount: legacyRecords.length,
+      messagesToRemove: migratedMessageIds.length,
+      momentsAlreadyMigrated: legacyRecords.length - moments.length,
+      momentsToCreate: moments.length,
+      removedMessageCount: request.method === 'POST' ? migratedMessageIds.length : 0,
+      createdMomentCount: request.method === 'POST' ? moments.length : 0,
+      personId: person._id?.toString(),
+      personName: person.name,
+      ownerDisplayName: ownerProfile.displayName,
+      ownerUsername: ownerProfile.username || null,
+      messageCountAfter: (person.messages || []).length
+        - (request.method === 'POST' ? migratedMessageIds.length : 0),
+      momentCountAfter: (person.moments || []).length
+        + (request.method === 'POST' ? moments.length : 0),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.use('/api/people', requireAuthentication)
 app.use('/api/messages', requireAuthentication)
 app.use('/api/thanks', requireAuthentication)
@@ -70,9 +182,14 @@ app.get('/api/messages/received', async (request, response, next) => {
     const messages = records
       .flatMap((record) => {
         const sender = profileByUid.get(record.ownerId)
-        return (record.messages || []).map((message) => ({
+        return (record.messages || [])
+          .filter((message) => message.type === 'special')
+          .map((message) => ({
           id: message._id.toString(),
-          text: message.text,
+          type: 'special' as const,
+          title: message.title || '',
+          description: message.description || message.text || '',
+          text: message.description || message.text || '',
           createdAt: message.createdAt.toISOString(),
           sender: {
             displayName: sender?.displayName || 'Alguém especial',
@@ -495,10 +612,24 @@ app.post('/api/people/:id/messages', async (request, response, next) => {
       response.status(400).json({ error: 'Pessoa inválida.' })
       return
     }
-    const text = String(request.body.text || '').trim()
-    if (!text || text.length > 280) {
+    const title = String(request.body.title || '').trim()
+    const description = String(request.body.description || '').trim()
+    const type = String(request.body.type || 'moment')
+    if (!['moment', 'special'].includes(type)) {
       response.status(400).json({
-        error: 'Escreva uma mensagem de até 280 caracteres.',
+        error: 'Escolha um tipo de mensagem válido.',
+      })
+      return
+    }
+    if (!title || title.length > 40) {
+      response.status(400).json({
+        error: 'Informe um título de até 40 caracteres.',
+      })
+      return
+    }
+    if (!description || description.length > 250) {
+      response.status(400).json({
+        error: 'Escreva uma descrição de até 250 caracteres.',
       })
       return
     }
@@ -506,7 +637,9 @@ app.post('/api/people/:id/messages', async (request, response, next) => {
     const now = new Date()
     const message: MessageDocument = {
       _id: new ObjectId(),
-      text,
+      type: type as MessageDocument['type'],
+      title,
+      description,
       createdAt: now,
     }
     const updated = await (await people()).findOneAndUpdate(
@@ -522,6 +655,46 @@ app.post('/api/people/:id/messages', async (request, response, next) => {
       return
     }
     response.status(201).json(serializePerson(updated))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/people/:id/moments', async (request, response, next) => {
+  try {
+    if (!ObjectId.isValid(request.params.id)) {
+      response.status(400).json({ error: 'Pessoa inválida.' })
+      return
+    }
+
+    const ownerId = request.user!.uid
+    const collection = await people()
+    const person = await collection.findOne({
+      _id: new ObjectId(request.params.id),
+      ownerId,
+    })
+    if (!person) {
+      response.status(404).json({ error: 'Pessoa não encontrada.' })
+      return
+    }
+
+    const sent = (person.moments || []).map((moment) => ({
+      ...serializeMoment(moment),
+      direction: 'sent' as const,
+    }))
+    const received = person.linkedUserId
+      ? ((await collection.findOne({
+          ownerId: person.linkedUserId,
+          linkedUserId: ownerId,
+        }))?.moments || []).map((moment) => ({
+          ...serializeMoment(moment),
+          direction: 'received' as const,
+        }))
+      : []
+
+    response.json([...sent, ...received].sort((left, right) => (
+      right.createdAt.localeCompare(left.createdAt)
+    )))
   } catch (error) {
     next(error)
   }
@@ -545,7 +718,9 @@ app.post('/api/people/:id/moments', async (request, response, next) => {
     }
 
     const customText = String(request.body?.text || '').trim()
-    const messages = person.messages || []
+    const messages = (person.messages || []).filter((message) => (
+      !message.type || message.type === 'moment'
+    ))
     if (!customText && messages.length === 0) {
       response.status(409).json({
         error: 'Cadastre ao menos uma mensagem para essa pessoa.',
@@ -560,7 +735,7 @@ app.post('/api/people/:id/moments', async (request, response, next) => {
     const moment: MomentDocument = {
       _id: new ObjectId(),
       messageId: selected?._id || null,
-      text: customText || selected!.text,
+      text: customText || selected!.description || selected!.text || '',
       createdAt: new Date(),
     }
     const updated = await collection.findOneAndUpdate(
